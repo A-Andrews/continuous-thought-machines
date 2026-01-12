@@ -22,6 +22,7 @@ from models.ctm_rl import ContinuousThoughtMachineRL
 from models.lstm_rl import LSTMBaseline
 from utils.housekeeping import set_seed
 from tasks.rl.envs import MaskVelocityWrapper
+from tasks.rl.vgdl_env import VGDLGymEnv
 from tasks.rl.utils import combine_tracking_data
 from tasks.rl.plotting import make_rl_gif
 from tasks.image_classification.plotting import plot_neural_dynamics
@@ -49,6 +50,11 @@ def parse_args():
     parser.add_argument('--env_id', type=str, default="Acrobot-v1", help='Environment ID.')
     parser.add_argument('--mask_velocity', action=argparse.BooleanOptionalAction, default=True, help='Mask the velocity components of the observation.')
     parser.add_argument('--max_environment_steps', type=int, default=500, help='The maximum number of environment steps.')
+    parser.add_argument('--vgdl_game', type=str, default=None, help='VGDL game name (base file name without .txt).')
+    parser.add_argument('--vgdl_games_root', type=str, default='/well/costa/users/zqa082/brain-wide_strategies/RC_RL/all_games', help='Root folder containing VGDL game files.')
+    parser.add_argument('--vgdl_obs_size', type=int, default=84, help='Resize VGDL observations to this size.')
+    parser.add_argument('--vgdl_grayscale', action=argparse.BooleanOptionalAction, default=True, help='Convert VGDL observations to grayscale.')
+    parser.add_argument('--vgdl_flatten_obs', action=argparse.BooleanOptionalAction, default=False, help='Flatten VGDL observations to a vector.')
 
     # Training Configuration
     parser.add_argument('--num_steps', type=int, default=100, help='The number of environment steps to run in each environment per policy rollout.')
@@ -96,6 +102,21 @@ def make_env_minigrid(env_id, max_environment_steps):
     def thunk():
         env = gym.make(env_id, max_steps=max_environment_steps, render_mode="rgb_array")
         env = ImgObsWrapper(env)
+        env = NormalizeReward(env, gamma=0.99, epsilon=1e-8)
+        env = gym.wrappers.TimeLimit(env, max_episode_steps=max_environment_steps)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        return env
+    return thunk
+
+def make_env_vgdl(game_name, game_folder, max_environment_steps, obs_size=84, grayscale=True, flatten=False):
+    def thunk():
+        env = VGDLGymEnv(
+            game_name=game_name,
+            game_folder=game_folder,
+            obs_size=obs_size,
+            grayscale=grayscale,
+            flatten=flatten,
+        )
         env = NormalizeReward(env, gamma=0.99, epsilon=1e-8)
         env = gym.wrappers.TimeLimit(env, max_episode_steps=max_environment_steps)
         env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -294,6 +315,15 @@ def plot_activations(agent, device, args):
                 eval_env = make_env_classic_control(args.env_id, args.max_environment_steps, mask_velocity=args.mask_velocity, render_mode="rgb_array")()
             elif "MiniGrid" in args.env_id:
                 eval_env = make_env_minigrid(args.env_id, args.max_environment_steps)()
+            elif args.env_id == "VGDL":
+                eval_env = make_env_vgdl(
+                    args.vgdl_game,
+                    args.vgdl_games_root,
+                    args.max_environment_steps,
+                    obs_size=args.vgdl_obs_size,
+                    grayscale=args.vgdl_grayscale,
+                    flatten=args.vgdl_flatten_obs,
+                )()
             else:
                 raise NotImplementedError(f"Environment {args.env_id} not supported.")
 
@@ -384,6 +414,20 @@ if __name__ == "__main__":
         envs = gym.vector.SyncVectorEnv([make_env_classic_control(args.env_id, args.max_environment_steps, args.mask_velocity) for _ in range(args.num_envs)])
     elif "MiniGrid" in args.env_id:
         envs = gym.vector.SyncVectorEnv([make_env_minigrid(args.env_id, args.max_environment_steps) for _ in range(args.num_envs)])
+    elif args.env_id == "VGDL":
+        if not args.vgdl_game:
+            raise ValueError("VGDL requires --vgdl_game to be set.")
+        envs = gym.vector.SyncVectorEnv([
+            make_env_vgdl(
+                args.vgdl_game,
+                args.vgdl_games_root,
+                args.max_environment_steps,
+                obs_size=args.vgdl_obs_size,
+                grayscale=args.vgdl_grayscale,
+                flatten=args.vgdl_flatten_obs,
+            )
+            for _ in range(args.num_envs)
+        ])
 
     agent = Agent(envs.single_action_space.n, args, device).to(device)
     plot_activations(agent, device, args)
