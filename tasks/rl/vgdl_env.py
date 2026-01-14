@@ -18,6 +18,7 @@ class VGDLGymEnv(gym.Env):
         obs_size: int = 84,
         grayscale: bool = True,
         flatten: bool = False,
+        level: int = 0,
         render_mode: str | None = None,
     ) -> None:
         super().__init__()
@@ -26,10 +27,11 @@ class VGDLGymEnv(gym.Env):
         self._obs_size = obs_size
         self._grayscale = grayscale
         self._flatten = flatten
+        self._level = level
         self._render_mode = render_mode
 
         self._env = _get_vgdl_env_class(game_folder)(game_name, game_folder)
-        self._env.set_level(0)
+        self._env.set_level(level)
 
         self.action_space = gym.spaces.Discrete(len(self._env.actions))
 

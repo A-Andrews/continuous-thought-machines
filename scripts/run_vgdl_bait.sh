@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --partition=gpu_short
 #SBATCH --gres=gpu:1
+#SBATCH --constraint=v100
 #SBATCH --job-name=vgdl_bait
 #SBATCH --output=logs/vgdl_bait_%j.out
 #SBATCH --error=logs/vgdl_bait_%j.err
@@ -30,10 +31,18 @@ source "/gpfs3/well/costa/users/zqa082/brain-wide_strategies/continuous-thought-
 export PYTHONPATH="/gpfs3/well/costa/users/zqa082/brain-wide_strategies/RC_RL:$PYTHONPATH"
 
 set -euo pipefail
+if command -v nvidia-smi >/dev/null 2>&1; then
+  if ! nvidia-smi --query-gpu=name --format=csv,noheader | grep -q "V100"; then
+    echo "Error: This job requires a V100 GPU. Allocated GPU(s):"
+    nvidia-smi
+    exit 1
+  fi
+fi
 
 python -m tasks.rl.train \
   --env_id VGDL \
   --vgdl_game vgfmri4_bait \
+  --vgdl_curriculum 0 1 2 3 \
   --vgdl_games_root /well/costa/users/zqa082/brain-wide_strategies/RC_RL/all_games \
   --num_envs 4 \
   --max_environment_steps 500 \

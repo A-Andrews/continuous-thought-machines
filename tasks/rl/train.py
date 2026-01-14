@@ -53,6 +53,8 @@ def parse_args():
     parser.add_argument('--mask_velocity', action=argparse.BooleanOptionalAction, default=True, help='Mask the velocity components of the observation.')
     parser.add_argument('--max_environment_steps', type=int, default=500, help='The maximum number of environment steps.')
     parser.add_argument('--vgdl_game', type=str, default=None, help='VGDL game name (base file name without .txt).')
+    parser.add_argument('--vgdl_level', type=int, default=0, help='VGDL level index to play.')
+    parser.add_argument('--vgdl_curriculum', type=int, nargs='+', default=None, help='Ordered list of VGDL levels for curriculum training. Overrides --vgdl_level if set.')
     parser.add_argument('--vgdl_games_root', type=str, default='/well/costa/users/zqa082/brain-wide_strategies/RC_RL/all_games', help='Root folder containing VGDL game files.')
     parser.add_argument('--vgdl_obs_size', type=int, default=84, help='Resize VGDL observations to this size.')
     parser.add_argument('--vgdl_grayscale', action=argparse.BooleanOptionalAction, default=True, help='Convert VGDL observations to grayscale.')
@@ -201,7 +203,7 @@ def make_env_minigrid(env_id, max_environment_steps):
         return env
     return thunk
 
-def make_env_vgdl(game_name, game_folder, max_environment_steps, obs_size=84, grayscale=True, flatten=False):
+def make_env_vgdl(game_name, game_folder, max_environment_steps, obs_size=84, grayscale=True, flatten=False, level=0):
     def thunk():
         env = VGDLGymEnv(
             game_name=game_name,
@@ -209,12 +211,41 @@ def make_env_vgdl(game_name, game_folder, max_environment_steps, obs_size=84, gr
             obs_size=obs_size,
             grayscale=grayscale,
             flatten=flatten,
+            level=level,
         )
         env = NormalizeReward(env, gamma=0.99, epsilon=1e-8)
         env = gym.wrappers.TimeLimit(env, max_episode_steps=max_environment_steps)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         return env
     return thunk
+
+def make_vector_envs(args):
+    if args.env_id in ("CartPole-v1", "Acrobot-v1"):
+        return gym.vector.SyncVectorEnv([
+            make_env_classic_control(args.env_id, args.max_environment_steps, args.mask_velocity)
+            for _ in range(args.num_envs)
+        ])
+    if "MiniGrid" in args.env_id:
+        return gym.vector.SyncVectorEnv([
+            make_env_minigrid(args.env_id, args.max_environment_steps)
+            for _ in range(args.num_envs)
+        ])
+    if args.env_id == "VGDL":
+        if not args.vgdl_game:
+            raise ValueError("VGDL requires --vgdl_game to be set.")
+        return gym.vector.SyncVectorEnv([
+            make_env_vgdl(
+                args.vgdl_game,
+                args.vgdl_games_root,
+                args.max_environment_steps,
+                obs_size=args.vgdl_obs_size,
+                grayscale=args.vgdl_grayscale,
+                flatten=args.vgdl_flatten_obs,
+                level=args.vgdl_level,
+            )
+            for _ in range(args.num_envs)
+        ])
+    raise NotImplementedError(f"Environment {args.env_id} not supported.")
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -416,6 +447,7 @@ def plot_activations(agent, device, args):
                     obs_size=args.vgdl_obs_size,
                     grayscale=args.vgdl_grayscale,
                     flatten=args.vgdl_flatten_obs,
+                    level=args.vgdl_level,
                 )()
             else:
                 raise NotImplementedError(f"Environment {args.env_id} not supported.")
@@ -485,6 +517,24 @@ def initialise_dynamic_args(args):
     args.num_training_iterations = args.total_timesteps // args.batch_size
     return args
 
+def build_vgdl_curriculum(args):
+    if args.env_id != "VGDL":
+        return None, [args.num_training_iterations + 1]
+    if not args.vgdl_game:
+        raise ValueError("VGDL requires --vgdl_game to be set.")
+
+    levels = args.vgdl_curriculum or [args.vgdl_level]
+    total_iterations = args.num_training_iterations + 1
+    base_iters = total_iterations // len(levels)
+    if base_iters < 1:
+        raise ValueError(
+            "Curriculum has more levels than training iterations; increase total_timesteps "
+            "or reduce the number of levels."
+        )
+    iterations = [base_iters] * len(levels)
+    iterations[-1] += total_iterations - base_iters * len(levels)
+    return levels, iterations
+
 if __name__ == "__main__":
 
     args = initialize_args()
@@ -503,30 +553,20 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Environment Setup
-    if args.env_id in ("CartPole-v1", "Acrobot-v1"):
-        envs = gym.vector.SyncVectorEnv([make_env_classic_control(args.env_id, args.max_environment_steps, args.mask_velocity) for _ in range(args.num_envs)])
-    elif "MiniGrid" in args.env_id:
-        envs = gym.vector.SyncVectorEnv([make_env_minigrid(args.env_id, args.max_environment_steps) for _ in range(args.num_envs)])
-    elif args.env_id == "VGDL":
-        if not args.vgdl_game:
-            raise ValueError("VGDL requires --vgdl_game to be set.")
-        envs = gym.vector.SyncVectorEnv([
-            make_env_vgdl(
-                args.vgdl_game,
-                args.vgdl_games_root,
-                args.max_environment_steps,
-                obs_size=args.vgdl_obs_size,
-                grayscale=args.vgdl_grayscale,
-                flatten=args.vgdl_flatten_obs,
-            )
-            for _ in range(args.num_envs)
-        ])
+    curriculum_levels, curriculum_iterations = build_vgdl_curriculum(args)
+    if curriculum_levels is None:
+        curriculum_levels = [None]
+    else:
+        args.vgdl_level = curriculum_levels[0]
+
+    envs = make_vector_envs(args)
 
     agent = Agent(envs.single_action_space.n, args, device).to(device)
     plot_activations(agent, device, args)
     print(f'Total params: {sum(p.numel() for p in agent.parameters())}')
     optimizer = optim.Adam(agent.parameters(), lr=args.lr, eps=1e-5)
+    expected_action_space = envs.single_action_space
+    expected_obs_space = envs.single_observation_space
 
     checkpoint_path = f"{args.log_dir}/checkpoint.pt"
     if os.path.exists(checkpoint_path) and args.reload:
@@ -534,243 +574,272 @@ if __name__ == "__main__":
     else:
         global_step, training_iteration, episode_rewards_tracking, episode_lengths_tracking, global_steps_tracking = 0, 0, [], [], []
 
-    # Rollout buffer
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
-
     start_time = time.time()
-    next_obs, _ = envs.reset(seed=args.seed)
-    next_obs = torch.Tensor(next_obs).to(device)
-    next_done = torch.zeros(args.num_envs).to(device)
-    next_state = agent.get_initial_state(args.num_envs)
+    progress_bar = tqdm(
+        total=args.num_training_iterations + 1,
+        initial=training_iteration,
+        desc="Training",
+        dynamic_ncols=True,
+    )
 
-    progress_bar = tqdm(range(training_iteration, args.num_training_iterations + 1), total=args.num_training_iterations + 1, initial=training_iteration, desc="Training", dynamic_ncols=True,)
+    phase_start = 0
+    for phase_idx, phase_iterations in enumerate(curriculum_iterations):
+        if args.env_id == "VGDL":
+            args.vgdl_level = curriculum_levels[phase_idx]
+            if phase_idx > 0:
+                envs.close()
+                envs = make_vector_envs(args)
+                if envs.single_action_space != expected_action_space:
+                    raise ValueError("Curriculum levels must share the same action space.")
+                if envs.single_observation_space.shape != expected_obs_space.shape:
+                    raise ValueError("Curriculum levels must share the same observation shape.")
+            if args.vgdl_curriculum:
+                print(f"Curriculum phase {phase_idx + 1}/{len(curriculum_levels)}: level {args.vgdl_level}")
 
-    for training_iteration in progress_bar:
-        initial_state = (next_state[0].clone(), next_state[1].clone())
+        phase_done = max(0, training_iteration - phase_start)
+        if phase_done >= phase_iterations:
+            phase_start += phase_iterations
+            continue
 
-        if args.anneal_lr:
-            frac = 1.0 - (training_iteration - 1.0) / args.num_training_iterations
-            lrnow = frac * args.lr
-            optimizer.param_groups[0]["lr"] = lrnow
+        # Rollout buffer
+        obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
+        actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+        logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
+        rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
+        dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
+        values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
-        for step in range(0, args.num_steps):
-            next_obs = torch.Tensor(next_obs).to(device)
-            global_step += args.num_envs
-            obs[step] = next_obs
-            dones[step] = next_done
+        next_obs, _ = envs.reset(seed=args.seed)
+        next_obs = torch.Tensor(next_obs).to(device)
+        next_done = torch.zeros(args.num_envs).to(device)
+        next_state = agent.get_initial_state(args.num_envs)
 
-            with torch.no_grad():
-                action, logprob, _, value, next_state, _, _, _ = agent.get_action_and_value(next_obs, next_state, next_done)
-                values[step] = value.flatten()
-            actions[step] = action
-            logprobs[step] = logprob
-            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
-            next_done = np.logical_or(terminations, truncations)
-            rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
+        for phase_iter in range(phase_done, phase_iterations):
+            training_iteration = phase_start + phase_iter
+            initial_state = (next_state[0].clone(), next_state[1].clone())
 
-            if "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info and "episode" in info[0]:
-                        progress_bar.set_postfix({
-                            "step": global_step,
-                            "train. iter": training_iteration,
-                            "return": round(info[0]["episode"]["r"], 2),
-                            "length": info[0]["episode"]["l"]
-                        })
-                        log_scalars(
-                            writer,
-                            wandb_run,
-                            {
-                                "charts/episodic_return": info[0]["episode"]["r"],
-                                "charts/episodic_length": info[0]["episode"]["l"],
-                            },
-                            global_step,
-                        )
-                        episode_rewards_tracking.append(info[0]["episode"]["r"])
-                        episode_lengths_tracking.append(info[0]["episode"]["l"])
-                        global_steps_tracking.append(global_step)
+            if args.anneal_lr:
+                frac = 1.0 - (training_iteration - 1.0) / args.num_training_iterations
+                lrnow = frac * args.lr
+                optimizer.param_groups[0]["lr"] = lrnow
 
-            elif "episode" in infos:
-                if infos["episode"]:
-                    episode_rewards = infos["episode"]["r"]
-                    episode_lengths = infos["episode"]["l"]
-                    completed_episodes = infos["episode"]["_r"]
-                    for env_idx in range(len(completed_episodes)):
-                        if completed_episodes[env_idx]:
+            for step in range(0, args.num_steps):
+                next_obs = torch.Tensor(next_obs).to(device)
+                global_step += args.num_envs
+                obs[step] = next_obs
+                dones[step] = next_done
+
+                with torch.no_grad():
+                    action, logprob, _, value, next_state, _, _, _ = agent.get_action_and_value(next_obs, next_state, next_done)
+                    values[step] = value.flatten()
+                actions[step] = action
+                logprobs[step] = logprob
+                next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+                next_done = np.logical_or(terminations, truncations)
+                rewards[step] = torch.tensor(reward).to(device).view(-1)
+                next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
+
+                if "final_info" in infos:
+                    for info in infos["final_info"]:
+                        if info and "episode" in info[0]:
                             progress_bar.set_postfix({
                                 "step": global_step,
                                 "train. iter": training_iteration,
-                                "return": round(episode_rewards[env_idx], 2),
-                                "length": episode_lengths[env_idx]
+                                "return": round(info[0]["episode"]["r"], 2),
+                                "length": info[0]["episode"]["l"]
                             })
                             log_scalars(
                                 writer,
                                 wandb_run,
                                 {
-                                    "charts/episodic_return": episode_rewards[env_idx],
-                                    "charts/episodic_length": episode_lengths[env_idx],
+                                    "charts/episodic_return": info[0]["episode"]["r"],
+                                    "charts/episodic_length": info[0]["episode"]["l"],
                                 },
                                 global_step,
                             )
-                            episode_rewards_tracking.append(episode_rewards[env_idx])
-                            episode_lengths_tracking.append(episode_lengths[env_idx])
+                            episode_rewards_tracking.append(info[0]["episode"]["r"])
+                            episode_lengths_tracking.append(info[0]["episode"]["l"])
                             global_steps_tracking.append(global_step)
 
-        with torch.no_grad():
-            next_value = agent.get_value(
-                next_obs,
-                next_state,
-                next_done,
-            ).reshape(1, -1)
-            advantages = torch.zeros_like(rewards).to(device)
-            lastgaelam = 0
-            for t in reversed(range(args.num_steps)):
-                if t == args.num_steps - 1:
-                    nextnonterminal = 1.0 - next_done
-                    nextvalues = next_value
-                else:
-                    nextnonterminal = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
-                delta = rewards[t] + args.discount_gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = delta + args.discount_gamma * args.gae_lambda * nextnonterminal * lastgaelam
-            returns = advantages + values
+                elif "episode" in infos:
+                    if infos["episode"]:
+                        episode_rewards = infos["episode"]["r"]
+                        episode_lengths = infos["episode"]["l"]
+                        completed_episodes = infos["episode"]["_r"]
+                        for env_idx in range(len(completed_episodes)):
+                            if completed_episodes[env_idx]:
+                                progress_bar.set_postfix({
+                                    "step": global_step,
+                                    "train. iter": training_iteration,
+                                    "return": round(episode_rewards[env_idx], 2),
+                                    "length": episode_lengths[env_idx]
+                                })
+                                log_scalars(
+                                    writer,
+                                    wandb_run,
+                                    {
+                                        "charts/episodic_return": episode_rewards[env_idx],
+                                        "charts/episodic_length": episode_lengths[env_idx],
+                                    },
+                                    global_step,
+                                )
+                                episode_rewards_tracking.append(episode_rewards[env_idx])
+                                episode_lengths_tracking.append(episode_lengths[env_idx])
+                                global_steps_tracking.append(global_step)
 
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
-        b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-        b_dones = dones.reshape(-1)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
-
-        assert args.num_envs % args.num_minibatches == 0
-        envsperbatch = args.num_envs // args.num_minibatches
-        envinds = np.arange(args.num_envs)
-        flatinds = np.arange(args.batch_size).reshape(args.num_steps, args.num_envs)
-        clipfracs = []
-        for epoch in range(args.update_epochs):
-            for start in range(0, args.num_envs, envsperbatch):
-                end = start + envsperbatch
-                mbenvinds = envinds[start:end]
-                mb_inds = flatinds[:, mbenvinds].ravel()
-
-                if args.model_type == "ctm":
-                    selected_hidden_state = (initial_state[0][mbenvinds,:,:], initial_state[1][mbenvinds,:,:])
-                elif args.model_type == "lstm":
-                    selected_hidden_state = (initial_state[0][mbenvinds,:], initial_state[1][mbenvinds,:])
-
-
-                _, newlogprob, entropy, newvalue, _, _, _, _ = agent.get_action_and_value(
-                    b_obs[mb_inds],
-                    selected_hidden_state,
-                    b_dones[mb_inds],
-                    b_actions.long()[mb_inds],
-                )
-
-                logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = logratio.exp()
-
-                with torch.no_grad():
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
-
-                mb_advantages = b_advantages[mb_inds]
-                if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-
-                # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                # Value loss
-                newvalue = newvalue.view(-1)
-                if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
-                        -args.clip_coef,
-                        args.clip_coef,
-                    )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
-                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
-                else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-
-
-                entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
-
-                optimizer.zero_grad()
-                loss.backward()
-
-                # Log gradient norms
-                total_norm = 0
-                for name, param in agent.named_parameters():
-                    if param.grad is None:
-                        print(f"Warning: Gradient for {name} is None!")
+            with torch.no_grad():
+                next_value = agent.get_value(
+                    next_obs,
+                    next_state,
+                    next_done,
+                ).reshape(1, -1)
+                advantages = torch.zeros_like(rewards).to(device)
+                lastgaelam = 0
+                for t in reversed(range(args.num_steps)):
+                    if t == args.num_steps - 1:
+                        nextnonterminal = 1.0 - next_done
+                        nextvalues = next_value
                     else:
-                        param_norm = param.grad.data.norm(2).item()
-                        total_norm += param_norm ** 2
-                        log_scalar(
-                            writer,
-                            wandb_run,
-                            f"grad_norms/{name}",
-                            param_norm,
-                            global_step,
-                            log_wandb=args.wandb_log_gradients,
+                        nextnonterminal = 1.0 - dones[t + 1]
+                        nextvalues = values[t + 1]
+                    delta = rewards[t] + args.discount_gamma * nextvalues * nextnonterminal - values[t]
+                    advantages[t] = lastgaelam = delta + args.discount_gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                returns = advantages + values
+
+            b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+            b_logprobs = logprobs.reshape(-1)
+            b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+            b_dones = dones.reshape(-1)
+            b_advantages = advantages.reshape(-1)
+            b_returns = returns.reshape(-1)
+            b_values = values.reshape(-1)
+
+            assert args.num_envs % args.num_minibatches == 0
+            envsperbatch = args.num_envs // args.num_minibatches
+            envinds = np.arange(args.num_envs)
+            flatinds = np.arange(args.batch_size).reshape(args.num_steps, args.num_envs)
+            clipfracs = []
+            for epoch in range(args.update_epochs):
+                for start in range(0, args.num_envs, envsperbatch):
+                    end = start + envsperbatch
+                    mbenvinds = envinds[start:end]
+                    mb_inds = flatinds[:, mbenvinds].ravel()
+
+                    if args.model_type == "ctm":
+                        selected_hidden_state = (initial_state[0][mbenvinds,:,:], initial_state[1][mbenvinds,:,:])
+                    elif args.model_type == "lstm":
+                        selected_hidden_state = (initial_state[0][mbenvinds,:], initial_state[1][mbenvinds,:])
+
+
+                    _, newlogprob, entropy, newvalue, _, _, _, _ = agent.get_action_and_value(
+                        b_obs[mb_inds],
+                        selected_hidden_state,
+                        b_dones[mb_inds],
+                        b_actions.long()[mb_inds],
+                    )
+
+                    logratio = newlogprob - b_logprobs[mb_inds]
+                    ratio = logratio.exp()
+
+                    with torch.no_grad():
+                        old_approx_kl = (-logratio).mean()
+                        approx_kl = ((ratio - 1) - logratio).mean()
+                        clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+
+                    mb_advantages = b_advantages[mb_inds]
+                    if args.norm_adv:
+                        mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+
+                    # Policy loss
+                    pg_loss1 = -mb_advantages * ratio
+                    pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                    # Value loss
+                    newvalue = newvalue.view(-1)
+                    if args.clip_vloss:
+                        v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                        v_clipped = b_values[mb_inds] + torch.clamp(
+                            newvalue - b_values[mb_inds],
+                            -args.clip_coef,
+                            args.clip_coef,
                         )
-                total_norm = total_norm ** 0.5
-                log_scalar(
-                    writer,
-                    wandb_run,
-                    "grad_norms/total",
-                    total_norm,
-                    global_step,
-                    log_wandb=args.wandb_log_gradients,
-                )
+                        v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                        v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                        v_loss = 0.5 * v_loss_max.mean()
+                    else:
+                        v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
 
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
+                    entropy_loss = entropy.mean()
+                    loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
-            if args.target_kl is not None and approx_kl > args.target_kl:
-                break
+                    optimizer.zero_grad()
+                    loss.backward()
 
-        if training_iteration % args.track_every == 0 or training_iteration == 1:
-            plot_activations(agent, device, args)
+                    # Log gradient norms
+                    total_norm = 0
+                    for name, param in agent.named_parameters():
+                        if param.grad is None:
+                            print(f"Warning: Gradient for {name} is None!")
+                        else:
+                            param_norm = param.grad.data.norm(2).item()
+                            total_norm += param_norm ** 2
+                            log_scalar(
+                                writer,
+                                wandb_run,
+                                f"grad_norms/{name}",
+                                param_norm,
+                                global_step,
+                                log_wandb=args.wandb_log_gradients,
+                            )
+                    total_norm = total_norm ** 0.5
+                    log_scalar(
+                        writer,
+                        wandb_run,
+                        "grad_norms/total",
+                        total_norm,
+                        global_step,
+                        log_wandb=args.wandb_log_gradients,
+                    )
 
-        if training_iteration % args.save_every == 0 or training_iteration == 1 or global_step == args.total_timesteps-1:
-            save_model(agent, optimizer, global_step, training_iteration, episode_rewards_tracking, episode_lengths_tracking, global_steps_tracking, args, f"{args.log_dir}/checkpoint.pt")
 
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
-        var_y = np.var(y_true)
-        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                    optimizer.step()
 
-        log_scalars(
-            writer,
-            wandb_run,
-            {
-                "charts/lr": optimizer.param_groups[0]["lr"],
-                "losses/value_loss": v_loss.item(),
-                "losses/policy_loss": pg_loss.item(),
-                "losses/entropy": entropy_loss.item(),
-                "losses/old_approx_kl": old_approx_kl.item(),
-                "losses/approx_kl": approx_kl.item(),
-                "losses/clipfrac": np.mean(clipfracs),
-                "losses/explained_variance": explained_var,
-                "charts/SPS": int(global_step / (time.time() - start_time)),
-            },
-            global_step,
-        )
+                if args.target_kl is not None and approx_kl > args.target_kl:
+                    break
+
+            if training_iteration % args.track_every == 0 or training_iteration == 1:
+                plot_activations(agent, device, args)
+
+            if training_iteration % args.save_every == 0 or training_iteration == 1 or global_step == args.total_timesteps-1:
+                save_model(agent, optimizer, global_step, training_iteration, episode_rewards_tracking, episode_lengths_tracking, global_steps_tracking, args, f"{args.log_dir}/checkpoint.pt")
+
+            y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+            var_y = np.var(y_true)
+            explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+            log_scalars(
+                writer,
+                wandb_run,
+                {
+                    "charts/lr": optimizer.param_groups[0]["lr"],
+                    "losses/value_loss": v_loss.item(),
+                    "losses/policy_loss": pg_loss.item(),
+                    "losses/entropy": entropy_loss.item(),
+                    "losses/old_approx_kl": old_approx_kl.item(),
+                    "losses/approx_kl": approx_kl.item(),
+                    "losses/clipfrac": np.mean(clipfracs),
+                    "losses/explained_variance": explained_var,
+                    "charts/SPS": int(global_step / (time.time() - start_time)),
+                },
+                global_step,
+            )
+
+            progress_bar.update(1)
+
+        phase_start += phase_iterations
 
     envs.close()
     writer.close()
