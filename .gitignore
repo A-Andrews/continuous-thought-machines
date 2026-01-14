@@ -24,3 +24,4 @@ examples/*
 checkpoints
 utils/hugging_face/
 .venv
+wandb/

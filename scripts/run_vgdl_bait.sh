@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --partition=gpu_long
+#SBATCH --partition=gpu_short
 #SBATCH --gres=gpu:1
-#SBATCH --job-name=vgdl_function_test
+#SBATCH --job-name=vgdl_bait
 #SBATCH --output=logs/vgdl_bait_%j.out
 #SBATCH --error=logs/vgdl_bait_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --mem=64G
+#SBATCH --mem=32G
 
 echo "------------------------------------------------"
 echo "Run on host: "`hostname`
@@ -15,14 +15,21 @@ echo "Username: "`whoami`
 echo "Started at: "`date`
 echo "------------------------------------------------"
 
-set -euo pipefail
+
+
+module load Miniforge3/24.1.2-0
+eval "$(conda shell.bash hook)"
+conda activate ctm-vgdl-py38
+export PATH="$HOME/.local/bin:$PATH"
+# export PYTHONPATH="/gpfs3/well/costa/users/zqa082/brain-wide_strategies/RC_RL:$PYTHONPATH"
+
 
 module load Python/3.11.3-GCCcore-12.3.0
 source "/gpfs3/well/costa/users/zqa082/brain-wide_strategies/continuous-thought-machines/.venv/bin/activate"
 
 export PYTHONPATH="/gpfs3/well/costa/users/zqa082/brain-wide_strategies/RC_RL:$PYTHONPATH"
-export SDL_VIDEODRIVER=dummy
-export SDL_AUDIODRIVER=dummy
+
+set -euo pipefail
 
 python -m tasks.rl.train \
   --env_id VGDL \
@@ -32,6 +39,9 @@ python -m tasks.rl.train \
   --max_environment_steps 500 \
   --neuron_select_type first-last \
   --log_dir logs/rl/vgdl_bait \
-  --run_name vgdl_bait
+  --run_name vgdl_bait \
+  --use_wandb \
+  --wandb_project continuous-thought-machines \
+  "$@"
 
 echo "Done"

@@ -5,6 +5,8 @@ https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppo_atari_lstm.py
 import os
 import time
 import multiprocessing
+import importlib
+import sys
 import gymnasium as gym
 import numpy as np
 import torch
@@ -84,9 +86,100 @@ def parse_args():
     parser.add_argument('--reload', action=argparse.BooleanOptionalAction, default=True, help='Reload checkpoint from log_dir?')
     parser.add_argument('--track_every', type=int, default=1000, help='Track metrics frequency.')
     parser.add_argument('--device', type=int, nargs='+', default=[-1], help='GPU(s) or -1 for CPU.')
+    parser.add_argument('--use_wandb', action=argparse.BooleanOptionalAction, default=False, help='Enable Weights & Biases logging.')
+    parser.add_argument('--wandb_project', type=str, default='continuous-thought-machines', help='W&B project name.')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity (user or team).')
+    parser.add_argument('--wandb_group', type=str, default=None, help='W&B group name.')
+    parser.add_argument('--wandb_run_id', type=str, default=None, help='W&B run id for resuming.')
+    parser.add_argument('--wandb_tags', type=str, nargs='*', default=None, help='W&B tags.')
+    parser.add_argument('--wandb_dir', type=str, default=None, help='W&B log dir.')
+    parser.add_argument('--wandb_log_gradients', action=argparse.BooleanOptionalAction, default=False, help='Log per-parameter gradient norms to W&B.')
 
     args = parser.parse_args()
     return args
+
+def _import_wandb():
+    try:
+        import wandb
+    except ImportError as exc:
+        raise ImportError(
+            "W&B logging requested but wandb is not installed. Install with `pip install wandb`."
+        ) from exc
+
+    if hasattr(wandb, "init"):
+        return wandb
+
+    original_sys_path = list(sys.path)
+    shadowed_paths = []
+    for path in sys.path:
+        candidate = os.path.join(path, "wandb")
+        if os.path.isdir(candidate) and not os.path.isfile(
+            os.path.join(candidate, "__init__.py")
+        ):
+            shadowed_paths.append(path)
+
+    if shadowed_paths:
+        sys.path = [path for path in sys.path if path not in shadowed_paths]
+        sys.modules.pop("wandb", None)
+        importlib.invalidate_caches()
+        try:
+            wandb = importlib.import_module("wandb")
+        except ImportError as exc:
+            raise ImportError(
+                "W&B logging requested but wandb is not installed. Install with `pip install wandb`."
+            ) from exc
+        finally:
+            sys.path = original_sys_path
+
+    if not hasattr(wandb, "init"):
+        module_location = getattr(wandb, "__file__", None)
+        namespace_paths = list(getattr(wandb, "__path__", []))
+        location_hint = module_location or (
+            ", ".join(namespace_paths) if namespace_paths else "unknown"
+        )
+        raise ImportError(
+            "W&B logging requested but the imported 'wandb' module does not expose "
+            f"`wandb.init` (loaded from {location_hint}). Remove/rename any non-package "
+            "`wandb/` directories on your PYTHONPATH or install the official W&B package."
+        )
+
+    return wandb
+
+
+def init_wandb(args):
+    if not args.use_wandb:
+        return None
+
+    wandb = _import_wandb()
+
+    wandb_kwargs = {
+        "project": args.wandb_project,
+        "name": args.run_name,
+        "entity": args.wandb_entity,
+        "group": args.wandb_group,
+        "tags": args.wandb_tags,
+    }
+    if args.wandb_run_id:
+        wandb_kwargs["id"] = args.wandb_run_id
+        wandb_kwargs["resume"] = "allow"
+    if args.wandb_dir:
+        wandb_kwargs["dir"] = args.wandb_dir
+    wandb_run = wandb.init(
+        **{key: value for key, value in wandb_kwargs.items() if value is not None},
+        config=vars(args),
+    )
+    return wandb_run
+
+def log_scalar(writer, wandb_run, name, value, step, log_wandb=True):
+    writer.add_scalar(name, value, step)
+    if wandb_run is not None and log_wandb:
+        wandb_run.log({name: value}, step=step)
+
+def log_scalars(writer, wandb_run, metrics, step, log_wandb=True):
+    for key, value in metrics.items():
+        writer.add_scalar(key, value, step)
+    if wandb_run is not None and log_wandb:
+        wandb_run.log(metrics, step=step)
 
 def make_env_classic_control(env_id, max_environment_steps, mask_velocity=True, render_mode=None):
     def thunk():
@@ -402,6 +495,7 @@ if __name__ == "__main__":
     print(f"Tensorboard logging to {args.tb_log_dir}/{args.run_name}")
 
     writer = SummaryWriter(f"{args.tb_log_dir}/{args.run_name}")
+    wandb_run = init_wandb(args)
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -489,8 +583,15 @@ if __name__ == "__main__":
                             "return": round(info[0]["episode"]["r"], 2),
                             "length": info[0]["episode"]["l"]
                         })
-                        writer.add_scalar("charts/episodic_return", info[0]["episode"]["r"], global_step)
-                        writer.add_scalar("charts/episodic_length", info[0]["episode"]["l"], global_step)
+                        log_scalars(
+                            writer,
+                            wandb_run,
+                            {
+                                "charts/episodic_return": info[0]["episode"]["r"],
+                                "charts/episodic_length": info[0]["episode"]["l"],
+                            },
+                            global_step,
+                        )
                         episode_rewards_tracking.append(info[0]["episode"]["r"])
                         episode_lengths_tracking.append(info[0]["episode"]["l"])
                         global_steps_tracking.append(global_step)
@@ -508,8 +609,15 @@ if __name__ == "__main__":
                                 "return": round(episode_rewards[env_idx], 2),
                                 "length": episode_lengths[env_idx]
                             })
-                            writer.add_scalar("charts/episodic_return", episode_rewards[env_idx], global_step)
-                            writer.add_scalar("charts/episodic_length", episode_lengths[env_idx], global_step)
+                            log_scalars(
+                                writer,
+                                wandb_run,
+                                {
+                                    "charts/episodic_return": episode_rewards[env_idx],
+                                    "charts/episodic_length": episode_lengths[env_idx],
+                                },
+                                global_step,
+                            )
                             episode_rewards_tracking.append(episode_rewards[env_idx])
                             episode_lengths_tracking.append(episode_lengths[env_idx])
                             global_steps_tracking.append(global_step)
@@ -612,9 +720,23 @@ if __name__ == "__main__":
                     else:
                         param_norm = param.grad.data.norm(2).item()
                         total_norm += param_norm ** 2
-                        writer.add_scalar(f"grad_norms/{name}", param_norm, global_step)
+                        log_scalar(
+                            writer,
+                            wandb_run,
+                            f"grad_norms/{name}",
+                            param_norm,
+                            global_step,
+                            log_wandb=args.wandb_log_gradients,
+                        )
                 total_norm = total_norm ** 0.5
-                writer.add_scalar("grad_norms/total", total_norm, global_step)
+                log_scalar(
+                    writer,
+                    wandb_run,
+                    "grad_norms/total",
+                    total_norm,
+                    global_step,
+                    log_wandb=args.wandb_log_gradients,
+                )
 
 
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
@@ -633,15 +755,24 @@ if __name__ == "__main__":
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        writer.add_scalar("charts/lr", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-        writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        log_scalars(
+            writer,
+            wandb_run,
+            {
+                "charts/lr": optimizer.param_groups[0]["lr"],
+                "losses/value_loss": v_loss.item(),
+                "losses/policy_loss": pg_loss.item(),
+                "losses/entropy": entropy_loss.item(),
+                "losses/old_approx_kl": old_approx_kl.item(),
+                "losses/approx_kl": approx_kl.item(),
+                "losses/clipfrac": np.mean(clipfracs),
+                "losses/explained_variance": explained_var,
+                "charts/SPS": int(global_step / (time.time() - start_time)),
+            },
+            global_step,
+        )
 
     envs.close()
     writer.close()
+    if wandb_run is not None:
+        wandb_run.finish()
