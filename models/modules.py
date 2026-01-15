@@ -369,6 +369,27 @@ class MiniGridBackbone(nn.Module):
         out = self.project_to_d_projection(torch.cat([obj_embed, color_embed, state_embed, pos_embed], dim=-1))
         return out
 
+class VGDLBackbone(nn.Module):
+    def __init__(self, d_input):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.LazyConv2d(32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.LazyConv2d(64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.LazyConv2d(64, kernel_size=3, stride=1),
+            nn.ReLU(),
+        )
+        self.project_to_d_input = nn.Sequential(
+            nn.Flatten(),
+            nn.LazyLinear(d_input * 2),
+            nn.GLU(),
+            nn.LayerNorm(d_input),
+        )
+
+    def forward(self, x):
+        return self.project_to_d_input(self.conv(x))
+
 class ClassicControlBackbone(nn.Module):
     def __init__(self, d_input):
         super().__init__()

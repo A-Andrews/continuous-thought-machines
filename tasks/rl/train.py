@@ -261,9 +261,11 @@ class Agent(nn.Module):
         self.model_type = args.model_type
 
         if "MiniGrid" in args.env_id:
-            backbone_type='navigation-backbone'
+            backbone_type = 'navigation-backbone'
+        elif args.env_id == "VGDL":
+            backbone_type = 'vision-backbone'
         else:
-            backbone_type='classic-control-backbone'
+            backbone_type = 'classic-control-backbone'
 
         if args.model_type == "ctm":
             self.recurrent_model = ContinuousThoughtMachineRL(

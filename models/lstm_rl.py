@@ -35,7 +35,7 @@ class LSTMBaseline(nn.Module):
         self.backbone_type = backbone_type
 
         # --- Input Assertions ---
-        assert backbone_type in ('navigation-backbone', 'classic-control-backbone'), f"Invalid backbone_type: {backbone_type}"
+        assert backbone_type in ('navigation-backbone', 'classic-control-backbone', 'vision-backbone'), f"Invalid backbone_type: {backbone_type}"
 
         # --- Backbone / Feature Extraction ---
         if self.backbone_type == 'navigation-backbone':
@@ -47,8 +47,12 @@ class LSTMBaseline(nn.Module):
             self.backbone = ClassicControlBackbone(d_input=d_input)
             lstm_cell_input_dim = d_input
 
+        elif self.backbone_type == 'vision-backbone':
+            self.backbone = VGDLBackbone(d_input=d_input)
+            lstm_cell_input_dim = d_input
+
         else:
-            raise NotImplemented('The only backbone supported for RL are for navigation (symbolic C x H x W inputs) and classic control (vectors of length D).')
+            raise NotImplemented('The only backbone supported for RL are for navigation (symbolic C x H x W inputs), vision (images), and classic control (vectors of length D).')
 
         # --- Core LSTM Modules ---
         self.lstm_cell = nn.LSTMCell(lstm_cell_input_dim, d_model)

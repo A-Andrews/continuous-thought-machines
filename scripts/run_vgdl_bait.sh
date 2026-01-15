@@ -39,10 +39,11 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   fi
 fi
 
+echo "Set up complete"
+# --vgdl_curriculum 0 1 2 3 \
 python -m tasks.rl.train \
   --env_id VGDL \
   --vgdl_game vgfmri4_bait \
-  --vgdl_curriculum 0 1 2 3 \
   --vgdl_games_root /well/costa/users/zqa082/brain-wide_strategies/RC_RL/all_games \
   --num_envs 4 \
   --max_environment_steps 500 \
