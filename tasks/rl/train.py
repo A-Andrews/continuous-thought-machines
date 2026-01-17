@@ -432,9 +432,15 @@ def load_model(agent, optimizer, checkpoint_path, device):
     print(f"Loaded checkpoint from {checkpoint_path} at iteration {training_iteration} and step {global_step}")
     return global_step, training_iteration, episode_rewards_tracking, episode_lengths_tracking, global_steps_tracking, model_args
 
+def get_step_dir(log_dir, global_step):
+    return os.path.join(log_dir, str(global_step))
 
-def plot_activations(agent, device, args):
+
+def plot_activations(agent, device, args, output_dir=None):
     agent.eval()
+    if output_dir is None:
+        output_dir = args.log_dir
+    os.makedirs(output_dir, exist_ok=True)
     with torch.no_grad():
         for idx in range(args.num_validation_envs):
             if args.env_id in ("CartPole-v1", "Acrobot-v1"):
@@ -489,7 +495,12 @@ def plot_activations(agent, device, args):
             combined_tracking_data = combine_tracking_data(tracking_data_by_world_step)
 
             n_to_plot = 80 if combined_tracking_data['post_activations'].shape[-1] < 100 else 100
-            plot_neural_dynamics(combined_tracking_data['post_activations'], n_to_plot, args.log_dir, axis_snap=True)
+            plot_neural_dynamics(
+                combined_tracking_data['post_activations'],
+                n_to_plot,
+                output_dir,
+                axis_snap=True,
+            )
 
             process = multiprocessing.Process(
                 target=make_rl_gif,
@@ -502,7 +513,7 @@ def plot_activations(agent, device, args):
                     combined_tracking_data['pre_activations'],
                     combined_tracking_data['post_activations'],
                     combined_tracking_data['inputs'],
-                    f"{args.log_dir}/eval_output_val_{idx}.gif"
+                    f"{output_dir}/eval_output_val_{idx}.gif"
                 )
             )
             process.start()
@@ -517,6 +528,10 @@ def initialise_dynamic_args(args):
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_training_iterations = args.total_timesteps // args.batch_size
+    if args.save_every <= 0:
+        args.save_every = max(1, args.num_training_iterations // 10)
+    if args.track_every <= 0:
+        args.track_every = max(1, args.num_training_iterations // 10)
     return args
 
 def build_vgdl_curriculum(args):
@@ -597,6 +612,7 @@ if __name__ == "__main__":
                     raise ValueError("Curriculum levels must share the same observation shape.")
             if args.vgdl_curriculum:
                 print(f"Curriculum phase {phase_idx + 1}/{len(curriculum_levels)}: level {args.vgdl_level}")
+            log_scalar(writer, wandb_run, "vgdl/level", args.vgdl_level, global_step)
 
         phase_done = max(0, training_iteration - phase_start)
         if phase_done >= phase_iterations:
@@ -813,10 +829,36 @@ if __name__ == "__main__":
                     break
 
             if training_iteration % args.track_every == 0 or training_iteration == 1:
-                plot_activations(agent, device, args)
+                step_dir = get_step_dir(args.log_dir, global_step)
+                os.makedirs(step_dir, exist_ok=True)
+                plot_activations(agent, device, args, output_dir=step_dir)
 
             if training_iteration % args.save_every == 0 or training_iteration == 1 or global_step == args.total_timesteps-1:
-                save_model(agent, optimizer, global_step, training_iteration, episode_rewards_tracking, episode_lengths_tracking, global_steps_tracking, args, f"{args.log_dir}/checkpoint.pt")
+                step_dir = get_step_dir(args.log_dir, global_step)
+                os.makedirs(step_dir, exist_ok=True)
+                save_model(
+                    agent,
+                    optimizer,
+                    global_step,
+                    training_iteration,
+                    episode_rewards_tracking,
+                    episode_lengths_tracking,
+                    global_steps_tracking,
+                    args,
+                    f"{step_dir}/checkpoint.pt",
+                )
+                # Keep a latest checkpoint at the run root for easy resume.
+                save_model(
+                    agent,
+                    optimizer,
+                    global_step,
+                    training_iteration,
+                    episode_rewards_tracking,
+                    episode_lengths_tracking,
+                    global_steps_tracking,
+                    args,
+                    f"{args.log_dir}/checkpoint.pt",
+                )
 
             y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
             var_y = np.var(y_true)

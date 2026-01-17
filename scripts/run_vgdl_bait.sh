@@ -40,16 +40,24 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 fi
 
 echo "Set up complete"
-# --vgdl_curriculum 0 1 2 3 \
+# Timestamped run folder + name for easy comparison.
+RUN_TS="$(date +%Y%m%d_%H%M%S)"
+RUN_DIR="results/vgdl_bait/${RUN_TS}"
+RUN_NAME="vgdl_bait_${RUN_TS}"
+mkdir -p "${RUN_DIR}"
+# 
 python -m tasks.rl.train \
   --env_id VGDL \
   --vgdl_game vgfmri4_bait \
+  --vgdl_curriculum 9 10 11 12 0 1 2 3 \
   --vgdl_games_root /well/costa/users/zqa082/brain-wide_strategies/RC_RL/all_games \
   --num_envs 4 \
   --max_environment_steps 500 \
   --neuron_select_type first-last \
-  --log_dir logs/rl/vgdl_bait \
-  --run_name vgdl_bait \
+  --save_every 0 \
+  --track_every 0 \
+  --log_dir "${RUN_DIR}" \
+  --run_name "${RUN_NAME}" \
   --use_wandb \
   --wandb_project continuous-thought-machines \
   "$@"
